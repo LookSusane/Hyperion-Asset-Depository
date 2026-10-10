@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+contract HyperionAssetDepository {
+    enum BondStatus { Active, Settled, Canceled }
+
+    struct BondTranche {
+        address payable issuer;
+        uint256 principalAmount;
+        uint256 couponYieldPool;
+        uint256 maturityTimestamp;
+        BondStatus status;
+        bytes32 trancheHash;
+    }
+
+    address payable public immutable depositoryGovernor;
+    string public protocolDescriptor;
+    uint256 public trancheCounter;
+    uint256 public totalActivePrincipal;
+    uint256 public totalYieldReserves;
+
+    mapping(uint256 => BondTranche) public tranches;
+
+    event BondIssued(uint256 indexed trancheId, address indexed issuer, uint256 principal, uint256 maturity);
+    event YieldAllocated(uint256 indexed trancheId, uint256 yieldAmount);
+    event YieldClaimed(uint256 indexed trancheId, address indexed receiver, uint256 amount);
+    event BondCanceled(uint256 indexed trancheId, uint256 returnedPrincipal);
+    event BondTenorRebalanced(uint256 indexed trancheId, uint256 newMaturity);
+    event OwnershipTransferred(uint256 indexed trancheId, address indexed oldIssuer, address indexed newIssuer);
+    event DescriptorChanged(string newDescriptor);
+    event ReservesDrained(address indexed receiver, uint256 amount);
+
+    modifier onlyGovernor() {
+        require(msg.sender == depositoryGovernor, "HyperionDepository: Access denied");
+        _;
+    }
+
+    constructor() {
+        depositoryGovernor = payable(msg.sender);
+        protocolDescriptor = "Hyperion Base Asset Depository & Bond Core v1";
+    }
+
+    // 1. allocateBondCouponYield
+    function allocateBondCouponYield(uint256 trancheId) external payable onlyGovernor {
+        BondTranche storage b = tranches[trancheId];
+        require(trancheId > 0 && trancheId <= trancheCounter, "HyperionDepository: Invalid tranche ID");
+        require(b.status == BondStatus.Active, "HyperionDepository: Tranche inactive");
+        require(msg.value > 0, "HyperionDepository: Zero yield deposit");
+
+        b.couponYieldPool += msg.value;
+        totalYieldReserves += msg.value;
+
+        emit YieldAllocated(trancheId, msg.value);
+    }
+
+    // 2. cancelBondListing
+    function cancelBondListing(uint256 trancheId) external {
+        BondTranche storage b = tranches[trancheId];
+        require(trancheId > 0 && trancheId <= trancheCounter, "HyperionDepository: Invalid ID");
+        require(b.issuer == msg.sender || msg.sender == depositoryGovernor, "HyperionDepository: Unauthorized");
+        require(b.status == BondStatus.Active, "HyperionDepository: Already inactive");
+
+        b.status = BondStatus.Canceled;
+        uint256 refund = b.principalAmount;
+        b.principalAmount = 0;
+        totalActivePrincipal -= refund;
+
+        if (refund > 0) {
+            (bool sent, ) = b.issuer.call{value: refund}("");
+            require(sent, "HyperionDepository: Principal return failed");
+        }
+
+        emit BondCanceled(trancheId, refund);
+    }
+
+    // 3. claimBondYield
+    function claimBondYield(uint256 trancheId, uint256 amount) external {
+        BondTranche storage b = tranches[trancheId];
+        require(trancheId > 0 && trancheId <= trancheCounter, "HyperionDepository: Invalid ID");
+        require(b.issuer == msg.sender || msg.sender == depositoryGovernor, "HyperionDepository: Unauthorized");
+        require(amount <= b.couponYieldPool && amount > 0, "HyperionDepository: Insufficient yield pool");
+
+        b.couponYieldPool -= amount;
+        totalYieldReserves -= amount;
+
+        (bool sent, ) = payable(msg.sender).call{value: amount}("");
+        require(sent, "HyperionDepository: Payout failed");
+
+        emit YieldClaimed(trancheId, msg.sender, amount);
+    }
+
+    // 4. drainDepositoryReserves
+    function drainDepositoryReserves() external onlyGovernor {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "HyperionDepository: Zero contract balance");
+
+        totalActivePrincipal = 0;
+        totalYieldReserves = 0;
+
+        (bool sent, ) = depositoryGovernor.call{value: balance}("");
+        require(sent, "HyperionDepository: Drain failed");
+
+        emit ReservesDrained(depositoryGovernor, balance);
+    }
+
+    // 5. issueBondTranche
+    function issueBondTranche(uint256 tenorSeconds, bytes32 trancheHash) external payable returns (uint256) {
+        require(msg.value > 0, "HyperionDepository: Principal required");
+        require(tenorSeconds >= 60, "HyperionDepository: Min tenor 60s");
+
+        trancheCounter++;
+        tranches[trancheCounter] = BondTranche({
+            issuer: payable(msg.sender),
+            principalAmount: msg.value,
+            couponYieldPool: 0,
+            maturityTimestamp: block.timestamp + tenorSeconds,
+            status: BondStatus.Active,
+            trancheHash: trancheHash
+        });
+
+        totalActivePrincipal += msg.value;
+        emit BondIssued(trancheCounter, msg.sender, msg.value, block.timestamp + tenorSeconds);
+        return trancheCounter;
+    }
+
+    // 6. rebalanceBondTenor
+    function rebalanceBondTenor(uint256 trancheId, uint256 extraSeconds) external {
+        BondTranche storage b = tranches[trancheId];
+        require(trancheId > 0 && trancheId <= trancheCounter, "HyperionDepository: Invalid ID");
+        require(b.issuer == msg.sender || msg.sender == depositoryGovernor, "HyperionDepository: Unauthorized");
+        require(b.status == BondStatus.Active, "HyperionDepository: Tranche inactive");
+
+        b.maturityTimestamp += extraSeconds;
+        emit BondTenorRebalanced(trancheId, b.maturityTimestamp);
+    }
+
+    // 7. transferBondOwnership
+    function transferBondOwnership(uint256 trancheId, address payable newIssuer) external {
+        BondTranche storage b = tranches[trancheId];
+        require(trancheId > 0 && trancheId <= trancheCounter, "HyperionDepository: Invalid ID");
+        require(b.issuer == msg.sender || msg.sender == depositoryGovernor, "HyperionDepository: Unauthorized");
+        require(newIssuer != address(0), "HyperionDepository: Zero recipient address");
+
+        address old = b.issuer;
+        b.issuer = newIssuer;
+        emit OwnershipTransferred(trancheId, old, newIssuer);
+    }
+
+    // 8. updateProtocolDescriptor
+    function updateProtocolDescriptor(string calldata newDescriptor) external onlyGovernor {
+        require(bytes(newDescriptor).length > 0, "HyperionDepository: Empty string");
+        protocolDescriptor = newDescriptor;
+        emit DescriptorChanged(newDescriptor);
+    }
+
+    // Чтение информации о транше
+    function getTrancheDetails(uint256 trancheId) external view returns (
+        address issuer,
+        uint256 principal,
+        uint256 yieldPool,
+        uint256 maturity,
+        BondStatus status
+    ) {
+        BondTranche memory b = tranches[trancheId];
+        return (b.issuer, b.principalAmount, b.couponYieldPool, b.maturityTimestamp, b.status);
+    }
+}
